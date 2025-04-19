@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import autopep8
 import subprocess
 import time
@@ -9,168 +9,222 @@ import re
 import os
 from pathlib import Path
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+from typing import Optional
 
-app = FastAPI(title="Code Evaluation & Optimization API")
+# Optional Pygments import for language detection
+try:
+    from pygments.lexers import guess_lexer
+    from pygments.util import ClassNotFound
+    _pygments_available = True
+except ImportError:
+    _pygments_available = False
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI
+app = FastAPI(
+    title="Auto Language Code Evaluation API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Environment Setup
-CACHE_DIR = Path("/.cache/huggingface")
+CACHE_DIR = Path("./.cache/huggingface")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["TRANSFORMERS_CACHE"] = str(CACHE_DIR)
 os.environ["HF_HOME"] = str(CACHE_DIR)
 
-# Lazy model loading with efficient memory management
-MODEL_NAME = "codellama/CodeLlama-7b-Instruct-hf"
+HF_TOKEN = os.getenv("HF_API_TOKEN")
 
-tokenizer = None
-model = None
+# Model Configuration
+MODEL_NAME = "Salesforce/codet5-small"
+tokenizer: Optional[AutoTokenizer] = None
+model: Optional[AutoModelForSeq2SeqLM] = None
 
-def load_model():
-    """Load the model only when it's needed to save memory."""
-    global tokenizer, model
-    if tokenizer is None or model is None:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                MODEL_NAME,
-                cache_dir=str(CACHE_DIR))
-            model = AutoModelForCausalLM.from_pretrained(
-                MODEL_NAME,
-                device_map="auto",
-                torch_dtype=torch.float16,  # Use float16 for memory optimization
-                cache_dir=str(CACHE_DIR))
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model: {str(e)}")
+# Supported language mapping
+LANG_EXT = {
+    'python': 'py',
+    'java': 'java',
+    'cpp': 'cpp',
+    'javascript': 'js'
+}
 
 # Request Model
 class CodeRequest(BaseModel):
     code: str
-    language: str = "python"
+    language: Optional[str] = None  # optional: auto-detect if not given
 
-# Helper Functions
+# Detect programming language
+def detect_language(code: str) -> str:
+    if not _pygments_available:
+        logger.warning('Pygments not installed; defaulting to python')
+        return 'python'
+    try:
+        lexer = guess_lexer(code)
+        alias = lexer.aliases[0]
+        if alias in ('python', 'py'):
+            return 'python'
+        elif alias == 'java':
+            return 'java'
+        elif alias in ('cpp', 'c++'):
+            return 'cpp'
+        elif alias in ('js', 'javascript', 'nodejs'):
+            return 'javascript'
+    except Exception as ex:
+        logger.warning(f'Language detection failed ({ex}); defaulting to python')
+    return 'python'
+
+# Code Evaluation
 def evaluate_code(user_code: str, lang: str) -> dict:
-    """Evaluate code for correctness, performance, and security"""
-    start_time = time.time()
-    file_ext = {"python": "py", "java": "java", "cpp": "cpp", "javascript": "js"}.get(lang, "txt")
+    file_ext = LANG_EXT.get(lang, 'txt')
     filename = f"temp_script.{file_ext}"
-
-    with open(filename, "w") as f:
-        f.write(user_code)
-
-    commands = {
-        "python": ["python3", filename],
-        "java": ["javac", filename, "&&", "java", filename.replace(".java", "")],
-        "cpp": ["g++", filename, "-o", "temp_script.out", "&&", "./temp_script.out"],
-        "javascript": ["node", filename]
-    }
-
     try:
+        with open(filename, "w") as f:
+            f.write(user_code)
+
+        commands = {
+            'python': ['python3', filename],
+            'java': ['javac', filename, '&&', 'java', filename.replace('.java', '')],
+            'cpp': ['g++', filename, '-o', 'temp_out', '&&', './temp_out'],
+            'javascript': ['node', filename]
+        }
+
+        start_time = time.time()
         if lang in commands:
-            result = subprocess.run(" ".join(commands[lang]), 
-                                capture_output=True, 
-                                text=True, 
-                                timeout=5, 
-                                shell=True)
+            proc = subprocess.run(' '.join(commands[lang]), capture_output=True,
+                                  text=True, timeout=15, shell=True)
             exec_time = time.time() - start_time
-            correctness = 1 if result.returncode == 0 else 0
-            error_message = None if correctness else result.stderr.strip()
+            success = proc.returncode == 0
+            stderr = proc.stderr.strip() if not success else None
         else:
-            return {"status": "error", "message": "Unsupported language", "score": 0}
-    except Exception as e:
-        return {"status": "error", "message": str(e), "score": 0}
+            return {'status': 'error', 'message': 'Unsupported language', 'score': 0}
 
-    # Scoring logic
-    readability_score = 20 if len(user_code) < 200 else 10
-    efficiency_score = 30 if exec_time < 1 else 10
-    security_score = 20 if "eval(" not in user_code and "exec(" not in user_code else 0
-    total_score = (correctness * 50) + readability_score + efficiency_score + security_score
+        score = 0
+        score += 50 if success else 0
+        score += 20 if len(user_code) < 200 else 10
+        score += 30 if exec_time < 1 else 10
+        score += 20 if not re.search(r"\b(eval|exec)\b", user_code) else 0
+        total = max(0, min(score, 100))
 
-    feedback = []
-    if correctness == 0:
-        feedback.append("❌ Error in Code Execution! Check syntax or logic errors.")
-        feedback.append(f"📌 Error Details: {error_message}")
-    else:
-        feedback.append("✅ Code executed successfully!")
+        feedback = []
+        if not success:
+            feedback.append(f"Error: {stderr}")
+        else:
+            feedback.append("Execution successful.")
+        if exec_time >= 1:
+            feedback.append("Performance: consider optimizing loops.")
+        if len(user_code) >= 200:
+            feedback.append("Readability: refactor into functions.")
+        if re.search(r"\b(eval|exec)\b", user_code):
+            feedback.append("Security: avoid eval()/exec().")
 
-    if efficiency_score < 30:
-        feedback.append("⚡ Performance Issue: Code took longer to execute. Optimize loops or calculations.")
-    if readability_score < 20:
-        feedback.append("📖 Readability Issue: Code is lengthy. Break into smaller functions.")
-    if security_score == 0:
-        feedback.append("🔒 Security Risk: Avoid using eval() or exec().")
+        return {
+            'status': 'success' if success else 'error',
+            'execution_time': round(exec_time, 3) if success else None,
+            'score': total,
+            'feedback': feedback
+        }
 
-    return {
-        "status": "success" if correctness else "error",
-        "execution_time": round(exec_time, 3) if correctness else None,
-        "score": max(0, min(100, total_score)),
-        "feedback": "\n".join(feedback),
-        "error_details": error_message if not correctness else None
-    }
+    except Exception as ex:
+        logger.error(f"Evaluation error: {ex}")
+        return {'status': 'error', 'message': str(ex), 'score': 0}
 
+# Fallback Optimizer
+def fallback_optimize_code(code: str, lang: str) -> str:
+    if lang == 'python':
+        optimized = autopep8.fix_code(code)
+        optimized += "\n# TIP: Break down large functions for readability."
+        return optimized
+    elif lang == 'java':
+        optimized = re.sub(r'{', '{\n', code)
+        optimized = re.sub(r';', ';\n', optimized)
+        optimized += "\n// TIP: Use streams and avoid nested loops when possible."
+        return optimized
+    elif lang == 'cpp':
+        optimized = re.sub(r'{', '{\n', code)
+        optimized = re.sub(r';', ';\n', optimized)
+        optimized += "\n// TIP: Consider STL algorithms and minimize pointer usage."
+        return optimized
+    return code + "\n# No optimization available for this language."
+
+# AI Optimizer
 def optimize_code_ai(user_code: str, lang: str) -> str:
-    """Generate optimized code using AI"""
-    load_model()  # Load the model only when optimization is requested
+    global tokenizer, model
     try:
-        if lang == "python":
-            user_code = autopep8.fix_code(user_code)
-            user_code = re.sub(r"eval\((.*)\)", r"int(\1)  # Removed eval for security", user_code)
-            user_code = re.sub(r"/ 0", "/ 1  # Fixed division by zero", user_code)
-        
-        prompt = f"Optimize this {lang} code:\n```{lang}\n{user_code}\n```\nOptimized version:"
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        
-        with torch.no_grad():  # Avoid unnecessary memory use
-            outputs = model.generate(**inputs, max_length=1024)
-        
-        optimized_code = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        code_match = re.search(r'```(?:python)?\n(.*?)\n```', optimized_code, re.DOTALL)
-        if code_match:
-            optimized_code = code_match.group(1)
-        
-        return optimized_code if optimized_code else user_code
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI optimization failed: {str(e)}")
+        if tokenizer is None or model is None:
+            logger.info('Loading model for optimization...')
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN, cache_dir=str(CACHE_DIR))
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                MODEL_NAME, token=HF_TOKEN, cache_dir=str(CACHE_DIR), torch_dtype=torch.float32
+            ).to('cpu')
+            logger.info('Model loaded on CPU')
+
+        logger.info(f'Generating optimized code for language: {lang}')
+        prompt = f"Improve the following {lang} code for readability, performance, and best practices:\n\n{user_code.strip()}\n"
+
+        inputs = tokenizer(prompt, return_tensors='pt', truncation=True).to('cpu')
+        outputs = model.generate(**inputs, max_length=512, num_beams=3, early_stopping=True)
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+        logger.info(f"Decoded Output: {decoded}")
+
+        if len(decoded) < 5 or decoded == user_code.strip():
+            raise ValueError("Model returned empty or unhelpful response")
+
+        return decoded
+
+    except Exception as ex:
+        logger.warning(f"LLM optimization failed: {ex} – Using fallback optimization.")
+        return fallback_optimize_code(user_code, lang)
 
 # API Endpoints
-@app.post("/evaluate")
-async def evaluate_endpoint(request: CodeRequest):
-    try:
-        result = evaluate_code(request.code, request.language)
-        return {"status": "success", "result": result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.post('/evaluate')
+async def evaluate_endpoint(req: CodeRequest):
+    lang = req.language or detect_language(req.code)
+    logger.info(f'Evaluate request language: {lang}')
+    result = evaluate_code(req.code, lang)
+    return {'language': lang, 'result': result}
 
-@app.post("/optimize")
-async def optimize_endpoint(request: CodeRequest):
-    try:
-        optimized = optimize_code_ai(request.code, request.language)
-        return {"status": "success", "optimized_code": optimized}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+@app.post('/optimize')
+async def optimize_endpoint(req: CodeRequest):
+    lang = req.language or detect_language(req.code)
+    logger.info(f'Optimize endpoint called; language: {lang}')
+    optimized_code = optimize_code_ai(req.code, lang)
+    return {'language': lang, 'optimized_code': optimized_code}
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "API is running",
-        "model": MODEL_NAME,
-        "endpoints": {
-            "evaluate": "POST /evaluate",
-            "optimize": "POST /optimize"
-        }
-    }
+@app.options('/evaluate')
+async def options_eval():
+    return Response(status_code=200, headers={'Access-Control-Allow-Origin': '*'})
 
-if __name__ == "__main__":
+@app.options('/optimize')
+async def options_opt():
+    return Response(status_code=200, headers={'Access-Control-Allow-Origin': '*'})
+
+@app.get('/health')
+async def health():
+    return {'status': 'ok' if model else 'loading'}
+
+@app.get('/')
+async def root():
+    return {'message': 'Auto Language Code API running'}
+
+# Only run locally with: python filename.py
+if __name__ == '__main__':
     import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8000))  # Railway will provide PORT
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
-
+    port = int(os.environ.get('PORT', 8080))
+    uvicorn.run('auto_lang_code_api:app', host='0.0.0.0', port=port, workers=1)
 
